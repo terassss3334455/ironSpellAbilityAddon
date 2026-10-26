@@ -1,0 +1,161 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+group = mod_group_id
+version = mod_version
+base { archivesName = 'ironSpellAbilityAddon' }
+
+java { toolchain.languageVersion = JavaLanguageVersion.of(17) }
+
+minecraft {
+    mappings channel: 'official', version: minecraft_version
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', "${projectDir}/build/createSrgToMcp/output.srg"
+            mods {
+                ironspellabilityaddon { source sourceSets.main }
+            }
+        }
+        server {
+            workingDirectory project.file('run')
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', "${projectDir}/build/createSrgToMcp/output.srg"
+            mods {
+                ironspellabilityaddon { source sourceSets.main }
+            }
+        }
+    }
+}
+
+repositories {
+    flatDir { dirs '../teramodGuard/build/libs' }
+    mavenCentral()
+    maven { url = 'https://maven.minecraftforge.net' }
+    maven { url = 'https://code.redspace.io/releases' }
+    maven { url = 'https://maven.theillusivec4.top/' }
+    maven { url = 'https://dl.cloudsmith.io/public/geckolib3/geckolib/maven/' }
+    maven { url = 'https://maven.kosmx.dev/' }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+
+    // AbilitysgorwMOD is compiled against locally and loaded as a sibling mod for dev runs.
+    compileOnly files('../teramodGuard/build/classes/java/main')
+    runtimeOnly fg.deobf('local:abilitysgorwmod:1.0.8')
+
+    // Iron's API is stable; the full artifact is also on the compile classpath because
+    // SpellDamageEvent exposes its SpellDamageSource type from a non-api package.
+    compileOnly fg.deobf("io.redspace:irons_spellbooks:${irons_spells_version}")
+    runtimeOnly fg.deobf("io.redspace:irons_spellbooks:${irons_spells_version}")
+    runtimeOnly fg.deobf("io.redspace:irons_lib:${irons_lib_version}")
+    compileOnly fg.deobf("top.theillusivec4.curios:curios-forge:${curios_version}:api")
+    runtimeOnly fg.deobf("top.theillusivec4.curios:curios-forge:${curios_version}")
+    runtimeOnly fg.deobf("software.bernie.geckolib:geckolib-forge-${geckolib_version}")
+    runtimeOnly fg.deobf("dev.kosmx.player-anim:player-animation-lib-forge:${player_animator_version}")
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+processResources {
+    inputs.property 'mod_version', project.version
+    filesMatching('META-INF/mods.toml') { expand 'mod_version': project.version }
+}
+
+
+tasks.register('addonContractTests', JavaExec) {
+    group = 'verification'
+    description = 'Runs dependency-free behavior contracts for slot, cooldown, and damage rules.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'net.coms.ironspellabilityaddon.AddonRulesContractTest'
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+}
+
+tasks.register('verifyAddonSourceContract') {
+    group = 'verification'
+    description = 'Checks the addon source still uses the tested Iron and AbilitysgorwMOD integration paths.'
+    dependsOn tasks.named('compileJava')
+    doLast {
+        def required = [
+            'src/main/java/net/coms/ironspellabilityaddon/SpellLoadout.java': [
+                'selection.getAllSpells()', 'isSpellLearned(spell)',
+                'loadout.remove("spell_" + index)', 'loadout.remove("level_" + index)',
+                'AddonRules.remainingCooldownTicks', 'AddonRules.cooldownExpiry'
+            ],
+            'src/main/java/net/coms/ironspellabilityaddon/SpellAbilityService.java': [
+                'CastSource.COMMAND', 'SpellAbilityEvents.Cooldown',
+                'AddonRules.shouldCommitCooldown(pending.effectRan)'
+            ],
+            'src/main/java/net/coms/ironspellabilityaddon/network/SetSpellSlotPacket.java': [
+                'AddonRules.isValidSlotUpdate'
+            ],
+            'src/main/java/net/coms/ironspellabilityaddon/network/CastSpellPacket.java': [
+                'AddonRules.isValidSlot(packet.slot)'
+            ],
+            'src/main/java/net/coms/ironspellabilityaddon/SpellDamageHandler.java': [
+                'AddonRules.strengthSpellDamageBonus', 'SpellAbilityEvents.SpellDamage'
+            ]
+        ]
+        def failures = []
+        required.each { relative, fragments ->
+            def source = file(relative)
+            if (!source.isFile()) failures << "missing source: ${relative}"
+            else fragments.each { fragment ->
+                if (!source.getText('UTF-8').contains(fragment)) failures << "${relative} is missing required contract: ${fragment}"
+            }
+        }
+        if (!failures.isEmpty()) throw new GradleException('Addon source contract failed: ' + failures.join('; '))
+        println "Addon source contract passed: ${required.values().sum { it.size() }} checks"
+    }
+}
+
+tasks.register('verifyAddonJar') {
+    group = 'verification'
+    description = 'Checks the built JAR metadata and ensures it contains only this addon, not base-mod classes.'
+    dependsOn tasks.named('jar')
+    doLast {
+        def artifact = tasks.named('jar').get().archiveFile.get().asFile
+        if (!artifact.isFile()) throw new GradleException("Addon JAR not found: ${artifact}")
+        def jar = new java.util.jar.JarFile(artifact)
+        try {
+            def entries = Collections.list(jar.entries()).collect { it.name } as Set
+            def requiredEntries = [
+                'META-INF/mods.toml',
+                'net/coms/ironspellabilityaddon/IronSpellAbilityAddon.class',
+                'net/coms/ironspellabilityaddon/AddonRules.class',
+                'net/coms/ironspellabilityaddon/SpellLoadout.class'
+            ]
+            def missing = requiredEntries.findAll { !entries.contains(it) }
+            if (!missing.isEmpty()) throw new GradleException("Addon JAR is missing required entries: ${missing}")
+            if (entries.any { it.startsWith('net/coms/abilitysgorwmod/') }) {
+                throw new GradleException('Addon JAR must not bundle AbilitysgorwMOD base classes.')
+            }
+            def descriptor = jar.getInputStream(jar.getEntry('META-INF/mods.toml')).getText('UTF-8')
+            ['modId="ironspellabilityaddon"', '1.20.1', '47.4.10', '1.0.8', '1.20.1-3.16.3'].each { value ->
+                if (!descriptor.contains(value)) throw new GradleException("Addon JAR metadata is missing: ${value}")
+            }
+            println "Addon JAR contract passed: ${artifact.name} (${artifact.length()} bytes)"
+        } finally {
+            jar.close()
+        }
+    }
+}
+
+tasks.register('verifyAddon') {
+    group = 'verification'
+    description = 'Runs unit-style contracts, source checks, and JAR metadata/scope checks.'
+    dependsOn tasks.named('addonContractTests'), tasks.named('verifyAddonSourceContract'), tasks.named('verifyAddonJar')
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('verifyAddon')
+}
